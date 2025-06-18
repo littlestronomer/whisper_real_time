@@ -8,6 +8,8 @@ faster-whisper
 webrtcvad
 resemblyzer
 scipy
+pyannote.audio
+python-dotenv
 # onnx
 # onnxruntime-gpu
 # pycuda
