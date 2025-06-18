@@ -1,7 +1,14 @@
 setuptools
 pyaudio
 SpeechRecognition
---extra-index-url https://download.pytorch.org/whl/cu116
+--extra-index-url https://download.pytorch.org/whl/cu118
 torch
 numpy
-git+https://github.com/openai/whisper.git
+faster-whisper
+webrtcvad
+resemblyzer
+scipy
+# onnx
+# onnxruntime-gpu
+# pycuda
+# tensorrt-cu12==10.9.0.34
