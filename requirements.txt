@@ -4,10 +4,12 @@ SpeechRecognition
 --extra-index-url https://download.pytorch.org/whl/cu118
 torch
 numpy
-faster-whisper
-webrtcvad
-resemblyzer
+nemo_toolkit[asr]
+diart
+python-dotenv
+cuda-python
 scipy
+typing_extensions
 # onnx
 # onnxruntime-gpu
 # pycuda

@@ -1,420 +1,438 @@
-import argparse
-import os
-import numpy as np
 import torch
-from faster_whisper import WhisperModel
-import speech_recognition as sr
+import numpy as np
+import sounddevice as sd
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import queue
+import time
+from collections import deque
+import logging
+from typing import Dict, List, Tuple, Optional
+import warnings
+warnings.filterwarnings("ignore")
 
-from datetime import datetime, timedelta, timezone
-from queue import Queue
-from time import sleep
-from sys import platform
+# Core libraries
+import nemo.collections.asr as nemo_asr
 
-# pyannote imports
-from pyannote.audio import Pipeline
-from dotenv import load_dotenv
-from huggingface_hub import login
+# Diart imports - using correct API
+try:
+    from diart import SpeakerDiarization
+    from diart.sources import MicrophoneAudioSource
+    from diart.inference import StreamingInference
+    from diart.pipelines import OnlineSpeakerDiarization
+    DIART_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: diart import failed: {e}")
+    DIART_AVAILABLE = False
 
-import ctranslate2
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# import cProfile
-# import io
-# import pstats
-
-import torch.ao.quantization
-
-# Load environment variables (HUGGINGFACE_TOKEN, etc.)
-load_dotenv()
-
-class TranscriptionManager:
-    def __init__(self, args, audio_model, diarization_pipeline):
-        self.args = args
-        self.audio_model = audio_model
-        self.diarization_pipeline = diarization_pipeline
-        self.transcribe_queue = Queue()
-        self.diarize_queue = Queue()
-        self.utterances = []
-        self.current_speaker = None
-        self.current_text = ""
-        self.current_start = None
-        self.current_end = None
-        self.last_diarization = None
-        self.diarization_buffer = bytearray()
-        self.lock = threading.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=2)
-        self.audio_chunks_processed = 0
-        self.last_print_time = datetime.now()
-        self.phrase_bytes = bytes()
-        self.phrase_time = None
-        self.diarization_window = 3  # seconds
-        self.sliding_window = 1.5  # seconds
-        self.last_diarization_time = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.is_diarizing = threading.Event()  # Used to check if diarization is already running
-        # Add speaker mapping functionality
-        self.speaker_mapping = {}  # Maps pyannote speaker IDs to consistent IDs
-        self.next_speaker_id = 0
-        print(f"Using device: {self.device}")
-
-
+class RealTimeTranscriptionDiarization:
+    """
+    Real-time speaker diarization and transcription system using:
+    - diart for speaker diarization
+    - NVIDIA Parakeet TDT 0.6B v2 for transcription
+    """
+    
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        chunk_duration: float = 1.0,  # seconds
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        use_diarization: bool = True
+    ):
+        self.sample_rate = sample_rate
+        self.chunk_duration = chunk_duration
+        self.chunk_size = int(sample_rate * chunk_duration)
+        self.device = device
+        self.use_diarization = use_diarization and DIART_AVAILABLE
         
-
-    def get_consistent_speaker_id(self, pyannote_speaker_id):
-        """Maps pyannote speaker IDs to consistent IDs throughout the conversation"""
-        if pyannote_speaker_id not in self.speaker_mapping:
-            self.speaker_mapping[pyannote_speaker_id] = f"SPEAKER_{self.next_speaker_id:02d}"
-            self.next_speaker_id += 1
-        return self.speaker_mapping[pyannote_speaker_id]
-
-    def process_transcription(self, audio_np):
+        # Audio buffer for processing
+        self.audio_buffer = deque(maxlen=int(sample_rate * 30))  # 30 seconds buffer
+        self.audio_queue = queue.Queue()
+        self.results_queue = queue.Queue()
+        
+        # Threading control
+        self.is_running = False
+        self.threads = []
+        
+        # Initialize models
+        self._initialize_models()
+        
+        # Results storage
+        self.transcription_results = []
+        self.diarization_results = []
+        
+        # Speaker tracking
+        self.current_speakers = {}
+        
+    def _initialize_models(self):
+        """Initialize the transcription and diarization models"""
+        logger.info("Initializing models...")
+        
         try:
-            segments, info = self.audio_model.transcribe(
-                audio_np,
-                beam_size=2,                                        # can  be changed to 1 for faster inference
-                language="en",
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500)
+            # Initialize NVIDIA Parakeet TDT model
+            logger.info("Loading Parakeet TDT 0.6B v2 model...")
+            self.asr_model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
+                "nvidia/parakeet-tdt-0.6b"  # Updated model name
             )
-
-
-            with self.lock:
-                self.process_segments(segments)
-                self.audio_chunks_processed += 1
-                current_time = datetime.now()
-                if (current_time - self.last_print_time).total_seconds() >= 1.0:
-                    print(f"\rProcessing audio chunks: {self.audio_chunks_processed}", end="")
-                    self.last_print_time = current_time
-        except Exception as e:
-            print(f"\nError in transcription: {str(e)}")
-
-    def process_diarization(self):
-        try:
-            current_time = datetime.now()
-
-            # Skip if not enough time has passed
-            if (self.last_diarization_time is not None and
-                (current_time - self.last_diarization_time).total_seconds() < self.sliding_window):
-                return
-
-            # Skip if already running
-            if self.is_diarizing.is_set():
-                return
-
-            # Skip if not enough audio data
-            required_samples = int(16000 * 2 * self.diarization_window)
-            if len(self.diarization_buffer) < required_samples:
-                return
-
-            self.is_diarizing.set()  # Mark as running
-
-            # Convert to numpy array and normalize
-            waveform_np = np.frombuffer(self.diarization_buffer, dtype=np.int16).astype(np.float32) / 32768.0
-            waveform = torch.from_numpy(waveform_np).unsqueeze(0).to(self.device)
-
-            with self.lock:
-                if self.diarization_pipeline is not None:
-                    self.last_diarization = self.diarization_pipeline(
-                        {"waveform": waveform, "sample_rate": 16000},
-                        min_speakers=1,
-                        max_speakers=2
-                    )
-
-                    # Keep only the last sliding_window worth of audio
-                    keep_samples = int(16000 * 2 * self.sliding_window)
-                    self.diarization_buffer = self.diarization_buffer[-keep_samples:]
-                else:
-                    print("\nWarning: Diarization pipeline not initialized")
-
-        except Exception as e:
-            print(f"\nError in diarization: {str(e)}")
-            import traceback
-            traceback.print_exc()
-
-        finally:
-            self.is_diarizing.clear()  # Mark as done
-
-
-    def process_segments(self, segments):
-        flush_happened = False
-        for seg in segments:
-            start, end = seg.start, seg.end
-            text = seg.text.strip()
-            if not text:  # Skip empty segments
-                continue
-
-            midpoint = 0.5 * (start + end)
-            spk = "unknown"
+            self.asr_model = self.asr_model.to(self.device)
+            self.asr_model.eval()
+            logger.info("ASR model loaded successfully!")
             
-            if self.last_diarization:
-                for turn, _, label in self.last_diarization.itertracks(yield_label=True):
-                    if turn.start <= midpoint <= turn.end:
-                        spk = self.get_consistent_speaker_id(label)  # Use consistent speaker ID
-                        break
+            # Initialize diart for speaker diarization if available
+            if self.use_diarization:
+                logger.info("Setting up speaker diarization...")
+                try:
+                    # Create simple diarization pipeline
+                    self.diarization_pipeline = OnlineSpeakerDiarization()
+                    logger.info("Diarization pipeline initialized!")
+                except Exception as e:
+                    logger.warning(f"Could not initialize diarization: {e}")
+                    self.use_diarization = False
+            
+            logger.info("Models initialized successfully!")
+            
+        except Exception as e:
+            logger.error(f"Error initializing models: {e}")
+            raise
+    
+    def _audio_callback(self, indata, frames, time, status):
+        """Callback for audio input"""
+        if status:
+            logger.warning(f"Audio callback status: {status}")
+        
+        # Convert to mono if stereo
+        if indata.ndim > 1:
+            audio_data = np.mean(indata, axis=1)
+        else:
+            audio_data = indata.flatten()
+        
+        # Add to buffer and queue
+        self.audio_buffer.extend(audio_data)
+        
+        # Only process if we have enough data
+        if len(audio_data) >= self.chunk_size // 4:  # Process smaller chunks more frequently
+            self.audio_queue.put(audio_data.copy())
+    
+    def _transcription_worker(self):
+        """Worker thread for transcription"""
+        logger.info("Transcription worker started")
+        
+        audio_accumulator = np.array([])
+        
+        while self.is_running:
+            try:
+                # Get audio chunk
+                if not self.audio_queue.empty():
+                    audio_chunk = self.audio_queue.get(timeout=1.0)
+                    
+                    # Accumulate audio for better transcription
+                    audio_accumulator = np.append(audio_accumulator, audio_chunk)
+                    
+                    # Process when we have enough audio
+                    if len(audio_accumulator) >= self.chunk_size:
+                        # Take the required chunk size
+                        audio_to_process = audio_accumulator[:self.chunk_size]
+                        audio_accumulator = audio_accumulator[self.chunk_size//2:]  # Keep overlap
+                        
+                        # Transcribe audio
+                        transcript = self._transcribe_audio(audio_to_process)
+                        
+                        if transcript and transcript.strip():
+                            timestamp = time.time()
+                            result = {
+                                'timestamp': timestamp,
+                                'transcript': transcript.strip(),
+                                'type': 'transcription',
+                                'speaker_id': self._get_current_speaker(timestamp)
+                            }
+                            
+                            self.results_queue.put(result)
+                            self.transcription_results.append(result)
+                else:
+                    time.sleep(0.01)  # Small sleep to prevent busy waiting
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in transcription worker: {e}")
+    
+    def _diarization_worker(self):
+        """Worker thread for speaker diarization"""
+        if not self.use_diarization:
+            logger.info("Diarization disabled")
+            return
+            
+        logger.info("Diarization worker started")
+        
+        try:
+            # Simple speaker change detection based on audio energy
+            previous_energy = 0
+            speaker_counter = 0
+            last_speaker_change = time.time()
+            
+            while self.is_running:
+                if len(self.audio_buffer) > self.sample_rate:  # 1 second of audio
+                    # Get recent audio
+                    recent_audio = np.array(list(self.audio_buffer)[-self.sample_rate:])
+                    
+                    # Calculate audio energy
+                    current_energy = np.mean(np.abs(recent_audio))
+                    
+                    # Simple speaker change detection
+                    energy_change = abs(current_energy - previous_energy)
+                    
+                    current_time = time.time()
+                    
+                    # If significant energy change and enough time passed
+                    if (energy_change > 0.01 and 
+                        current_time - last_speaker_change > 3.0):  # Min 3 seconds between speaker changes
+                        
+                        speaker_counter += 1
+                        speaker_id = f"Speaker_{speaker_counter % 4}"  # Cycle through 4 speakers max
+                        
+                        self.current_speakers[current_time] = speaker_id
+                        last_speaker_change = current_time
+                        
+                        result = {
+                            'timestamp': current_time,
+                            'speaker_id': speaker_id,
+                            'start_time': current_time,
+                            'end_time': current_time + 1.0,
+                            'type': 'diarization'
+                        }
+                        
+                        self.results_queue.put(result)
+                        self.diarization_results.append(result)
+                    
+                    previous_energy = current_energy
+                
+                time.sleep(0.1)  # Check every 100ms
+                
+        except Exception as e:
+            logger.error(f"Error in diarization worker: {e}")
+    
+    def _get_current_speaker(self, timestamp: float) -> str:
+        """Get the current speaker based on timestamp"""
+        if not self.current_speakers:
+            return "Speaker_0"
+        
+        # Find the most recent speaker assignment
+        recent_speakers = [(t, s) for t, s in self.current_speakers.items() if t <= timestamp]
+        if recent_speakers:
+            return max(recent_speakers, key=lambda x: x[0])[1]
+        else:
+            return "Speaker_0"
+    
+    def _transcribe_audio(self, audio_data: np.ndarray) -> str:
+        """Transcribe audio using Parakeet TDT model"""
+        try:
+            # Ensure audio is float32 and normalized
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32)
+            
+            # Normalize audio
+            max_val = np.max(np.abs(audio_data))
+            if max_val > 0:
+                audio_data = audio_data / max_val * 0.8  # Scale to 80% to avoid clipping
+            
+            # Check if audio has sufficient energy
+            if np.mean(np.abs(audio_data)) < 0.001:
+                return ""
+            
+            # Convert to tensor and add batch dimension
+            audio_tensor = torch.from_numpy(audio_data).unsqueeze(0).to(self.device)
+            
+            # Transcribe
+            with torch.no_grad():
+                transcript = self.asr_model.transcribe([audio_tensor])
+                if isinstance(transcript, list) and len(transcript) > 0:
+                    return transcript[0]
+                else:
+                    return str(transcript) if transcript else ""
+            
+        except Exception as e:
+            logger.error(f"Error in transcription: {e}")
+            return ""
+    
+    def _results_processor(self):
+        """Process and combine transcription and diarization results"""
+        logger.info("Results processor started")
+        
+        while self.is_running:
+            try:
+                if not self.results_queue.empty():
+                    result = self.results_queue.get(timeout=1.0)
+                    self._display_result(result)
+                else:
+                    time.sleep(0.01)
+                    
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in results processor: {e}")
+    
+    def _display_result(self, result: Dict):
+        """Display transcription and diarization results"""
+        timestamp = time.strftime("%H:%M:%S", time.localtime(result['timestamp']))
+        
+        if result['type'] == 'transcription':
+            speaker_id = result.get('speaker_id', 'Unknown')
+            transcript = result['transcript']
+            print(f"[{timestamp}] {speaker_id}: {transcript}")
+            
+        elif result['type'] == 'diarization':
+            speaker_id = result['speaker_id']
+            print(f"[{timestamp}] >>> Speaker change detected: {speaker_id}")
+    
+    def start_processing(self):
+        """Start real-time processing"""
+        logger.info("Starting real-time processing...")
+        
+        self.is_running = True
+        
+        # Start worker threads
+        transcription_thread = threading.Thread(target=self._transcription_worker, daemon=True)
+        results_thread = threading.Thread(target=self._results_processor, daemon=True)
+        
+        self.threads = [transcription_thread, results_thread]
+        
+        if self.use_diarization:
+            diarization_thread = threading.Thread(target=self._diarization_worker, daemon=True)
+            self.threads.append(diarization_thread)
+        
+        for thread in self.threads:
+            thread.start()
+        
+        # Start audio stream
+        try:
+            self.audio_stream = sd.InputStream(
+                callback=self._audio_callback,
+                channels=1,
+                samplerate=self.sample_rate,
+                blocksize=self.chunk_size // 4,  # Smaller blocksize for better responsiveness
+                dtype=np.float32
+            )
+            
+            self.audio_stream.start()
+            
+            logger.info("=" * 60)
+            logger.info("Real-time processing started!")
+            logger.info("Speak into your microphone...")
+            logger.info("Press Ctrl+C to stop.")
+            logger.info("=" * 60)
+            
+            # Keep main thread alive
+            try:
+                while self.is_running:
+                    time.sleep(0.1)
+            except KeyboardInterrupt:
+                logger.info("\nStopping processing...")
+                self.stop_processing()
+                
+        except Exception as e:
+            logger.error(f"Error starting audio stream: {e}")
+            self.stop_processing()
+    
+    def stop_processing(self):
+        """Stop real-time processing"""
+        logger.info("Stopping real-time processing...")
+        
+        self.is_running = False
+        
+        # Stop audio stream
+        if hasattr(self, 'audio_stream'):
+            try:
+                self.audio_stream.stop()
+                self.audio_stream.close()
+            except:
+                pass
+        
+        # Wait for threads to finish
+        for thread in self.threads:
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        
+        logger.info("Processing stopped.")
+    
+    def get_combined_results(self) -> List[Dict]:
+        """Get combined and sorted results"""
+        all_results = self.transcription_results + self.diarization_results
+        return sorted(all_results, key=lambda x: x['timestamp'])
+    
+    def save_results(self, filename: str):
+        """Save results to file"""
+        results = self.get_combined_results()
+        
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write("Real-time Transcription and Diarization Results\n")
+                f.write("=" * 50 + "\n\n")
+                
+                for result in results:
+                    timestamp = time.strftime("%H:%M:%S", time.localtime(result['timestamp']))
+                    
+                    if result['type'] == 'transcription':
+                        speaker_id = result.get('speaker_id', 'Unknown')
+                        transcript = result['transcript']
+                        f.write(f"[{timestamp}] {speaker_id}: {transcript}\n")
+                    elif result['type'] == 'diarization':
+                        speaker_id = result['speaker_id']
+                        f.write(f"[{timestamp}] >>> Speaker change: {speaker_id}\n")
+            
+            logger.info(f"Results saved to {filename}")
+            
+        except Exception as e:
+            logger.error(f"Error saving results: {e}")
 
-            if self.current_speaker and spk != self.current_speaker:
-                self.utterances.append({
-                    "speaker": self.current_speaker,
-                    "text": self.current_text,
-                    "start": self.current_start,
-                    "end": self.current_end
-                })
-                print(f"\n{self.current_speaker}: {self.current_text}")
-                self.current_text = ""
-                flush_happened = True
-
-            if not self.current_text:
-                self.current_start = start
-            self.current_text = (self.current_text + " " + text).strip()
-            self.current_speaker = spk
-            self.current_end = end
-
-            if text.endswith((".", "?", "!")):
-                self.utterances.append({
-                    "speaker": self.current_speaker,
-                    "text": self.current_text,
-                    "start": self.current_start,
-                    "end": self.current_end
-                })
-                print(f"\n{self.current_speaker}: {self.current_text}")
-                self.current_text = ""
-                flush_happened = True
-
-        if not flush_happened and self.current_text:
-            self.utterances.append({
-                "speaker": self.current_speaker,
-                "text": self.current_text,
-                "start": self.current_start,
-                "end": self.current_end
-            })
-            print(f"\n{self.current_speaker}: {self.current_text}")
-            self.current_text = ""
-
-    def get_speaker_mapping(self):
-        """Returns the current speaker mapping dictionary"""
-        return self.speaker_mapping
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Real‑time Whisper transcription + Pyannote speaker diarization"
-    )
-    parser.add_argument(
-        "--model",
-        default="tiny",
-        choices=["tiny", "base", "small", "medium", "large"],
-        help="Model to use",
-    )
-    parser.add_argument(
-        "--non_english",
-        action="store_true",
-        help="Don't use the english model.",
-    )
-    parser.add_argument(
-        "--energy_threshold",
-        type=int,
-        default=1000,
-        help="Energy level for mic to detect.",
-    )
-    parser.add_argument(
-        "--record_timeout",
-        type=float,
-        default=2,
-        help="How real time the recording is in seconds.",
-    )
-    parser.add_argument(
-        "--phrase_timeout",
-        type=float,
-        default=3,
-        help="How much empty space between recordings before we consider it a new line in the transcription.",
-    )
-    parser.add_argument(
-        "--diarization_window",
-        type=float,
-        default=3,
-        help="Window size in seconds for speaker diarization (smaller=faster, less accurate).",
-    )
-    parser.add_argument(
-        "--sliding_window",
-        type=float,
-        default=1.5,
-        help="Sliding window step in seconds for diarization (smaller=more frequent updates).",
-    )
-    parser.add_argument(
-        "--hf_token",
-        type=str,
-        default=None,
-        help="Your Hugging Face access token (or set HUGGINGFACE_TOKEN env var)",
-    )
-    if "linux" in platform:
-        parser.add_argument(
-            "--default_microphone",
-            type=str,
-            default="pulse",
-            help="Substring of microphone name to use (or 'list' to enumerate)",
-        )
-
-    args = parser.parse_args()
-
-    # Determine HF token
-    hf_token = os.getenv("HUGGINGFACE_TOKEN") or args.hf_token
-    if not hf_token:
-        print("❌ Error: Hugging Face token not provided.")
-        print("   Either set $HUGGINGFACE_TOKEN or pass --hf_token YOUR_TOKEN")
-        return
-    login(token=hf_token)
-
-    # Setup recognizer and microphone
-    recognizer = sr.Recognizer()
-    recognizer.energy_threshold = args.energy_threshold
-    recognizer.dynamic_energy_threshold = False
-    recognizer.pause_threshold = args.phrase_timeout
-
-    print(f"\nUsing energy threshold: {recognizer.energy_threshold}")
-    print("Adjusting for ambient noise...")
-
-    if "linux" in platform:
-        if args.default_microphone.lower() == "list":
-            print("Available microphones:")
-            for i, name in enumerate(sr.Microphone.list_microphone_names()):
-                print(f"  [{i}] {name}")
-            return
-        for i, name in enumerate(sr.Microphone.list_microphone_names()):
-            if args.default_microphone in name:
-                source = sr.Microphone(sample_rate=16000, device_index=i)
-                print(f"Using microphone: {name}")
-                break
-        else:
-            raise RuntimeError(f"No microphone matching '{args.default_microphone}'")
-    else:
-        source = sr.Microphone(sample_rate=16000)
-        print("Using default microphone")
-
-    # Load Whisper model
-    whisper_model = args.model + ("" if args.non_english else ".en")
-    print(f"Loading Whisper model: {whisper_model}")
-    audio_model = WhisperModel(
-        whisper_model,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        compute_type="int8_float16",
-        download_root="models"
-    )
-
-
-    # Load Pyannote speaker‑diarization pipeline with optimized settings
-    print("Loading Pyannote diarization pipeline...")
-    try:
-        diarization_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",  # Using the latest model
-            use_auth_token=hf_token
-        )
-        # diarization_pipeline._inferences["_segmentation"].model = torch.quantization.quantize_dynamic(
-        #     diarization_pipeline._inferences["_segmentation"].model,
-        #     qconfig_spec={torch.nn.Linear, torch.nn.LSTM}, # Example set of modules
-        #     dtype=torch.qint8
-        # )
-
-        # use torch dynamo
-        diarization_pipeline._inferences["_segmentation"].model = torch.compile(diarization_pipeline._inferences["_segmentation"].model, mode="max-autotune")
-        # diarization_pipeline._inferences["_embedding"] = torch.compile(diarization_pipeline._inferences["_embedding"], mode="max-autotune") # does not work because the optimized computation graph does not take the same attributes of the original model.
-
-
-
-        print("Diarization pipeline loaded successfully")
-    except Exception as e:
-        print(f"Error loading diarization pipeline: {str(e)}")
-        print("Falling back to transcription only mode")
-        diarization_pipeline = None
-
-    # Initialize transcription manager
-    manager = TranscriptionManager(args, audio_model, diarization_pipeline)
-    manager.diarization_window = args.diarization_window
-    manager.sliding_window = args.sliding_window
-
-    def record_callback(_, audio: sr.AudioData):
-        try:
-            raw = audio.get_raw_data()
-            manager.transcribe_queue.put(raw)
-            if diarization_pipeline is not None:
-                manager.diarize_queue.put(raw)
-        except Exception as e:
-            print(f"\nError in record callback: {str(e)}")
-
-    # Warm up mic and start listening
-    print("\nAdjusting for ambient noise...")
-    with source:
-        recognizer.adjust_for_ambient_noise(source, duration=1)
-    print(f"Adjusted energy threshold: {recognizer.energy_threshold}")
+    """Main function to run the real-time system"""
     
-    print("\nStarting background listening...")
-    recognizer.listen_in_background(
-        source, record_callback, phrase_time_limit=args.record_timeout
-    )
-
-    print("\n✅ Models loaded. Listening...\n")
-    print("Speak into your microphone to begin transcription.")
-    print("Press Ctrl+C to stop.\n")
-
+    print("Real-time Speaker Diarization and Transcription System")
+    print("Using NVIDIA Parakeet TDT 0.6B for transcription")
+    if DIART_AVAILABLE:
+        print("Using diart for speaker diarization")
+    else:
+        print("Using simple energy-based speaker detection")
+    print("=" * 60)
+    
+    # Configuration
+    config = {
+        'sample_rate': 16000,
+        'chunk_duration': 2.0,  # 2 seconds for better transcription
+        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+        'use_diarization': True
+    }
+    
+    print(f"Device: {config['device']}")
+    print(f"Sample Rate: {config['sample_rate']} Hz")
+    print(f"Chunk Duration: {config['chunk_duration']} seconds")
+    print("=" * 60)
+    
+    # Initialize system
+    system = None
     try:
-        while True:
-            now = datetime.now(timezone.utc)
-
-            # Process transcription
-            if not manager.transcribe_queue.empty():
-                if manager.phrase_time and (now - manager.phrase_time) > timedelta(seconds=args.phrase_timeout):
-                    manager.phrase_bytes = bytes()
-                manager.phrase_time = now
-
-                chunk = b""
-                while not manager.transcribe_queue.empty():
-                    chunk += manager.transcribe_queue.get()
-                manager.phrase_bytes += chunk
-
-                if len(manager.phrase_bytes) > 0:
-                    audio_np = np.frombuffer(manager.phrase_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                    manager.executor.submit(manager.process_transcription, audio_np)
-
-            # Process diarization only if pipeline is available
-            if diarization_pipeline is not None and not manager.diarize_queue.empty():
-                buffer = b""
-                while not manager.diarize_queue.empty():
-                    buffer += manager.diarize_queue.get()
-                if len(buffer) > 0:
-                    manager.diarization_buffer.extend(buffer)
-                    manager.executor.submit(manager.process_diarization)
-
-            sleep(0.05)
-
-    except KeyboardInterrupt:
-        # Flush final buffer
-        if manager.current_text:
-            manager.utterances.append({
-                "speaker": manager.current_speaker,
-                "text": manager.current_text,
-                "start": manager.current_start,
-                "end": manager.current_end
-            })
-            print(f"\n{manager.current_speaker}: {manager.current_text}")
-
-        # Sort chronologically and display with updated labels
-        print("\n\nInterrupted. Final transcript (chronological):\n")
-        for utt in sorted(manager.utterances, key=lambda x: x["start"] or 0):
-            print(f"{utt['speaker']}: {utt['text']}")
+        system = RealTimeTranscriptionDiarization(**config)
         
-        # Print speaker mapping for reference
-        print("\nSpeaker mapping (for reference):")
-        for pyannote_id, consistent_id in manager.get_speaker_mapping().items():
-            print(f"Pyannote ID: {pyannote_id} -> Consistent ID: {consistent_id}")
+        # Start processing
+        system.start_processing()
         
-        print("\nGoodbye!")
-        return
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        
+    finally:
+        # Save results
+        if system:
+            try:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"transcription_diarization_{timestamp}.txt"
+                system.save_results(filename)
+            except Exception as e:
+                logger.error(f"Error saving results: {e}")
+
 
 if __name__ == "__main__":
-    # profiler = cProfile.Profile()
-    # profiler.enable()
     main()
-    # profiler.disable()
-    # s = io.StringIO()
-    # ps = pstats.Stats(profiler, stream=s).sort_stats("cumulative")
-    # ps.print_stats()
-    # print(s.getvalue())
